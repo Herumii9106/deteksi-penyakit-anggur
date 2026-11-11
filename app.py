@@ -1,3 +1,4 @@
+import glob
 import os
 
 import cv2
@@ -8,10 +9,11 @@ from PIL import Image
 
 st.set_page_config(page_title="Deteksi Penyakit Daun Anggur", page_icon="🍇", layout="wide")
 
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 IMG_SIZE = (224, 224)
 DEFAULT_CLASSES = ["Black_Rot", "ESCA", "Healthy", "Leaf_Blight"]  # urutan alfabet = urutan Keras
 MODEL_CANDIDATES = ["model_anggur_terbaik.keras", "model_anggur_terbaik.h5"]
-CM_IMAGE = "hasil_evaluasi_confusion_matrix.png"
+CM_IMAGE = os.path.join(BASE_DIR, "hasil_evaluasi_confusion_matrix.png")
 
 
 # ----------------------------- Model -----------------------------
@@ -23,9 +25,17 @@ def load_model(path: str):
 
 
 def find_default_model():
-    for p in MODEL_CANDIDATES:
-        if os.path.exists(p):
-            return p
+    # 1) nama yang diharapkan
+    for name in MODEL_CANDIDATES:
+        full = os.path.join(BASE_DIR, name)
+        if os.path.exists(full):
+            return full
+    # 2) cadangan: file .keras / .h5 apa pun di folder aplikasi
+    for pattern in ("*.keras", "*.h5"):
+        found = [f for f in sorted(glob.glob(os.path.join(BASE_DIR, pattern)))
+                 if not os.path.basename(f).startswith("uploaded_")]
+        if found:
+            return found[0]
     return None
 
 
@@ -55,13 +65,21 @@ def predict(model, rgb: np.ndarray) -> np.ndarray:
 st.sidebar.title("🍇 Pengaturan")
 
 uploaded_model = st.sidebar.file_uploader("Upload model (.keras / .h5)", type=["keras", "h5"])
-model_path = None
 if uploaded_model is not None:
-    model_path = "uploaded_" + uploaded_model.name
+    model_path = os.path.join(BASE_DIR, "uploaded_" + uploaded_model.name)
     with open(model_path, "wb") as f:
         f.write(uploaded_model.getbuffer())
 else:
     model_path = find_default_model()
+
+# Status model (diagnostik)
+if model_path:
+    size_mb = os.path.getsize(model_path) / 1e6
+    st.sidebar.success(f"Model: {os.path.basename(model_path)} ({size_mb:.1f} MB)")
+else:
+    st.sidebar.error("File model tidak ditemukan di repo")
+    st.sidebar.write("File yang terlihat oleh aplikasi:")
+    st.sidebar.write(sorted(os.listdir(BASE_DIR)))
 
 class_text = st.sidebar.text_input("Nama kelas (urut alfabet, pisah koma)", ", ".join(DEFAULT_CLASSES))
 class_names = [c.strip() for c in class_text.split(",") if c.strip()]
@@ -89,12 +107,7 @@ with tab_pred:
         stage1 = denoise(rgb) if use_blur else rgb
         stage2 = green_mask(stage1) if use_mask else stage1
 
-        c1, c2, c3 = st.columns(3)
-        c1.image(rgb, caption="1. Gambar asli", use_container_width=True)
-        c2.image(stage1, caption="2. Setelah denoising" if use_blur else "2. Denoising (nonaktif)", use_container_width=True)
-        c3.image(stage2, caption="3. Setelah masking" if use_mask else "3. Masking (nonaktif)", use_container_width=True)
-
-        st.divider()
+        # Hasil prediksi ditampilkan di atas gambar supaya langsung terlihat
         if model_path is None:
             st.warning(
                 "Model belum ditemukan. Letakkan `model_anggur_terbaik.keras` di folder repo "
@@ -110,21 +123,30 @@ with tab_pred:
                     )
                 else:
                     best = int(np.argmax(probs))
-                    st.subheader(f"Prediksi: {class_names[best]}")
-                    st.metric("Keyakinan", f"{probs[best] * 100:.1f}%")
-                    st.bar_chart(pd.Series(probs, index=class_names, name="Probabilitas"))
+                    r1, r2 = st.columns([1, 2])
+                    with r1:
+                        st.subheader(f"Prediksi: {class_names[best]}")
+                        st.metric("Keyakinan", f"{probs[best] * 100:.1f}%")
+                    with r2:
+                        st.bar_chart(pd.Series(probs, index=class_names, name="Probabilitas"))
             except Exception as e:
                 st.error(f"Gagal memuat atau menjalankan model: {e}")
+
+        st.divider()
+        c1, c2, c3 = st.columns(3)
+        c1.image(rgb, caption="1. Gambar asli", width="stretch")
+        c2.image(stage1, caption="2. Setelah denoising" if use_blur else "2. Denoising (nonaktif)", width="stretch")
+        c3.image(stage2, caption="3. Setelah masking" if use_mask else "3. Masking (nonaktif)", width="stretch")
 
 with tab_eval:
     st.write("Hasil evaluasi dari notebook (confusion matrix dan classification report).")
     cm_file = st.file_uploader("Upload gambar confusion matrix (opsional)", type=["png", "jpg"], key="cm")
     if cm_file is not None:
-        st.image(cm_file, caption="Confusion Matrix", use_container_width=True)
+        st.image(cm_file, caption="Confusion Matrix", width="stretch")
     elif os.path.exists(CM_IMAGE):
-        st.image(CM_IMAGE, caption="Confusion Matrix", use_container_width=True)
+        st.image(CM_IMAGE, caption="Confusion Matrix", width="stretch")
     else:
-        st.info(f"Taruh `{CM_IMAGE}` di folder repo atau upload di atas.")
+        st.info("Taruh `hasil_evaluasi_confusion_matrix.png` di folder repo atau upload di atas.")
 
     report = st.text_area("Tempel classification report (opsional)", height=220)
     if report.strip():
