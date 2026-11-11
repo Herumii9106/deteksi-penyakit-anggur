@@ -1,0 +1,145 @@
+import os
+
+import cv2
+import numpy as np
+import pandas as pd
+import streamlit as st
+from PIL import Image
+
+st.set_page_config(page_title="Deteksi Penyakit Daun Anggur", page_icon="🍇", layout="wide")
+
+IMG_SIZE = (224, 224)
+DEFAULT_CLASSES = ["Black_Rot", "ESCA", "Healthy", "Leaf_Blight"]  # urutan alfabet = urutan Keras
+MODEL_CANDIDATES = ["model_anggur_terbaik.keras", "model_anggur_terbaik.h5"]
+CM_IMAGE = "hasil_evaluasi_confusion_matrix.png"
+
+
+# ----------------------------- Model -----------------------------
+@st.cache_resource(show_spinner="Memuat model...")
+def load_model(path: str):
+    import tensorflow as tf
+
+    return tf.keras.models.load_model(path, compile=False)
+
+
+def find_default_model():
+    for p in MODEL_CANDIDATES:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def has_rescaling_layer(model) -> bool:
+    return any(l.__class__.__name__ == "Rescaling" for l in model.layers)
+
+
+# ----------------------------- Preprocessing (OpenCV) -----------------------------
+def denoise(rgb: np.ndarray) -> np.ndarray:
+    return cv2.GaussianBlur(rgb, (5, 5), 0)
+
+
+def green_mask(rgb: np.ndarray) -> np.ndarray:
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    mask = cv2.inRange(hsv, np.array([35, 40, 40]), np.array([85, 255, 255]))
+    return cv2.bitwise_and(rgb, rgb, mask=mask)
+
+
+def predict(model, rgb: np.ndarray) -> np.ndarray:
+    x = cv2.resize(rgb, IMG_SIZE).astype("float32")
+    if not has_rescaling_layer(model):
+        x = x / 255.0  # model tanpa layer Rescaling butuh normalisasi manual
+    return model.predict(x[None, ...], verbose=0)[0]
+
+
+# ----------------------------- Sidebar -----------------------------
+st.sidebar.title("🍇 Pengaturan")
+
+uploaded_model = st.sidebar.file_uploader("Upload model (.keras / .h5)", type=["keras", "h5"])
+model_path = None
+if uploaded_model is not None:
+    model_path = "uploaded_" + uploaded_model.name
+    with open(model_path, "wb") as f:
+        f.write(uploaded_model.getbuffer())
+else:
+    model_path = find_default_model()
+
+class_text = st.sidebar.text_input("Nama kelas (urut alfabet, pisah koma)", ", ".join(DEFAULT_CLASSES))
+class_names = [c.strip() for c in class_text.split(",") if c.strip()]
+
+st.sidebar.subheader("Preprocessing sebelum prediksi")
+use_blur = st.sidebar.checkbox("Gaussian Blur (denoising)", value=True)
+use_mask = st.sidebar.checkbox("Masking warna hijau (HSV)", value=False)
+st.sidebar.caption(
+    "Aktifkan hanya jika model dilatih dengan preprocessing yang sama. "
+    "Masking hijau dapat ikut menghapus bercak penyakit (cokelat/kuning), jadi sebaiknya dimatikan."
+)
+
+# ----------------------------- Halaman utama -----------------------------
+st.title("Deteksi Penyakit Daun Anggur")
+st.caption("Pipeline: Input gambar → Denoising → (opsional) Masking → Resize 224×224 → CNN → Prediksi kelas")
+
+tab_pred, tab_eval, tab_info = st.tabs(["Prediksi", "Evaluasi Model", "Tentang Pipeline"])
+
+with tab_pred:
+    file = st.file_uploader("Upload foto daun anggur", type=["jpg", "jpeg", "png", "bmp"])
+    if file is None:
+        st.info("Upload sebuah gambar untuk melihat tahapan preprocessing dan hasil prediksi.")
+    else:
+        rgb = np.array(Image.open(file).convert("RGB"))
+        stage1 = denoise(rgb) if use_blur else rgb
+        stage2 = green_mask(stage1) if use_mask else stage1
+
+        c1, c2, c3 = st.columns(3)
+        c1.image(rgb, caption="1. Gambar asli", use_container_width=True)
+        c2.image(stage1, caption="2. Setelah denoising" if use_blur else "2. Denoising (nonaktif)", use_container_width=True)
+        c3.image(stage2, caption="3. Setelah masking" if use_mask else "3. Masking (nonaktif)", use_container_width=True)
+
+        st.divider()
+        if model_path is None:
+            st.warning(
+                "Model belum ditemukan. Letakkan `model_anggur_terbaik.keras` di folder repo "
+                "atau upload lewat sidebar."
+            )
+        else:
+            try:
+                model = load_model(model_path)
+                probs = predict(model, stage2)
+                if len(class_names) != len(probs):
+                    st.error(
+                        f"Jumlah kelas di sidebar ({len(class_names)}) tidak sama dengan output model ({len(probs)})."
+                    )
+                else:
+                    best = int(np.argmax(probs))
+                    st.subheader(f"Prediksi: {class_names[best]}")
+                    st.metric("Keyakinan", f"{probs[best] * 100:.1f}%")
+                    st.bar_chart(pd.Series(probs, index=class_names, name="Probabilitas"))
+            except Exception as e:
+                st.error(f"Gagal memuat atau menjalankan model: {e}")
+
+with tab_eval:
+    st.write("Hasil evaluasi dari notebook (confusion matrix dan classification report).")
+    cm_file = st.file_uploader("Upload gambar confusion matrix (opsional)", type=["png", "jpg"], key="cm")
+    if cm_file is not None:
+        st.image(cm_file, caption="Confusion Matrix", use_container_width=True)
+    elif os.path.exists(CM_IMAGE):
+        st.image(CM_IMAGE, caption="Confusion Matrix", use_container_width=True)
+    else:
+        st.info(f"Taruh `{CM_IMAGE}` di folder repo atau upload di atas.")
+
+    report = st.text_area("Tempel classification report (opsional)", height=220)
+    if report.strip():
+        st.code(report)
+
+with tab_info:
+    st.markdown(
+        """
+**Tahapan pipeline**
+
+1. **Input data mentah**: gambar dibaca dan diubah dari BGR ke RGB.
+2. **Denoising**: Gaussian Blur 5×5 untuk mengurangi noise.
+3. **Segmentasi ROI (opsional)**: masking HSV warna hijau.
+4. **Resize dan normalisasi**: 224×224, piksel diskalakan ke 0–1.
+5. **CNN**: 4 blok Conv2D + MaxPooling, Flatten, Dense 512, Dropout 0.5, Softmax.
+6. **Evaluasi**: classification report (precision, recall, F1) dan confusion matrix.
+"""
+    )
